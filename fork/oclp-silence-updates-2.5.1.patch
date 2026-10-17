@@ -1,0 +1,635 @@
+diff --git a/OpenCore-Patcher-GUI.spec b/OpenCore-Patcher-GUI.spec
+index b765aa5..a371785 100644
+--- a/OpenCore-Patcher-GUI.spec
++++ b/OpenCore-Patcher-GUI.spec
+@@ -20,6 +20,7 @@ block_cipher = None
+ datas = [
+    ('payloads.dmg', '.'),
+    ('Universal-Binaries.dmg', '.'),
++   ('Resetta-Aggiornamenti/resetta_aggiornamenti_bash.sh', 'Resetta-Aggiornamenti'),
+ ]
+ 
+ if Path("DortaniaInternalResources.dmg").exists():
+@@ -55,7 +56,7 @@ exe = EXE(pyz,
+           upx=True,
+           console=False,
+           disable_windowed_traceback=False,
+-          target_arch="universal2",
++          target_arch="x86_64",
+           codesign_identity=None,
+           entitlements_file=None)
+ 
+diff --git a/opencore_legacy_patcher/wx_gui/gui_main_menu.py b/opencore_legacy_patcher/wx_gui/gui_main_menu.py
+index 64595e3..75a5e44 100644
+--- a/opencore_legacy_patcher/wx_gui/gui_main_menu.py
++++ b/opencore_legacy_patcher/wx_gui/gui_main_menu.py
+@@ -30,6 +30,7 @@ from ..wx_gui import (
+     gui_settings,
+     gui_sys_patch_display,
+     gui_update,
++    gui_silence_updates,
+ )
+ 
+ 
+@@ -126,6 +127,15 @@ class MainFrame(wx.Frame):
+                 ],
+                 "icon": str(self.constants.icns_resource_path / "OC-Support.icns"),
+             },
++
++            "Silence Update Notifications": {
++                "function": self.on_silence_updates,
++                "description": [
++                    "Silences macOS update badges and",
++                    "notifications on Macs running via",
++                    "OpenCore (unsupported hardware).",
++                ],
++            },
+         }
+         button_x = 30
+         button_y = model_label.GetPosition()[1] + 30
+@@ -188,6 +198,11 @@ class MainFrame(wx.Frame):
+                 button_x = 320
+                 button_y = model_label.GetPosition()[1] + 30
+ 
++        # Con numero dispari di voci, o colonne di altezza diversa,
++        # la colonna di destra può scendere sotto la sinistra: usa il massimo
++        if button_y > max_height:
++            max_height = button_y
++
+ 
+         # Text: Copyright
+         copy_label = wx.StaticText(self, label=self.constants.copyright_date, pos=(-1, max_height - 15))
+@@ -247,6 +262,14 @@ class MainFrame(wx.Frame):
+ 
+ 
+     def _check_for_updates(self):
++        # Custom fork «Resetta Aggiornamenti»: auto-update DISATTIVATO.
++        # Un build da sorgente viene trattato come "nightly" e l'updater
++        # offre l'ultima release ufficiale: installandola, si perderebbe
++        # la voce "Silence Update Notifications". Gli aggiornamenti del
++        # fork arrivano dalla ricetta fork/costruisci-fork.sh (PyLab).
++        logging.info("Fork build: skipping update check")
++        return
++
+         if self.constants.has_checked_updates is True:
+             return
+ 
+@@ -311,6 +334,14 @@ class MainFrame(wx.Frame):
+             screen_location=self.GetPosition()
+         )
+ 
++    def on_silence_updates(self, event: wx.Event = None):
++        gui_silence_updates.SilenceUpdatesFrame(
++            parent=self,
++            title=self.title,
++            global_constants=self.constants,
++            screen_location=self.GetPosition()
++        )
++
+     def on_update(self, oclp_url: str, oclp_version: str, oclp_github_url: str):
+ 
+         ID_GITHUB = wx.NewId()
+diff --git a/opencore_legacy_patcher/wx_gui/gui_silence_updates.py b/opencore_legacy_patcher/wx_gui/gui_silence_updates.py
+new file mode 100644
+index 0000000..e0e6018
+--- /dev/null
++++ b/opencore_legacy_patcher/wx_gui/gui_silence_updates.py
+@@ -0,0 +1,538 @@
++"""
++gui_silence_updates.py: Generate GUI for silencing macOS update notifications
++
++Custom fork addition (strada C — companion OCLP, progetto PyLab
++"Resetta Aggiornamenti macOS"): su Mac che boota via OpenCore
++(hardware non supportato ufficialmente), il badge "1" di aggiornamento
++in Impostazioni di Sistema è una trappola per utenti non esperti.
++Questa finestra mostra il motivo, lo stato, e consente di silenziare
++(o ripristinare) le notifiche tramite il companion
++resetta_aggiornamenti_bash.sh (v8) installato con privilegi admin.
++
++Riferimenti:
++  - Companion: Resetta-Aggiornamenti/resetta_aggiornamenti_bash.sh (in app)
++  - Installato in: /Library/Application Support/Resetta Aggiornamenti/
++"""
++
++import os
++import wx
++import logging
++import sqlite3
++import plistlib
++import subprocess
++
++from typing import Optional
++from pathlib import Path
++
++from .. import constants
++
++from ..wx_gui import gui_support
++
++
++# Percorsi del companion (v8)
++OC_NVRAM_GUID = "4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102"
++RESETTA_DIR = "/Library/Application Support/Resetta Aggiornamenti"
++RESETTA_SCRIPT = f"{RESETTA_DIR}/resetta_aggiornamenti_bash.sh"
++DAEMON_LABEL = "it.enrico.resetta-aggiornamenti"
++DAEMON_PLIST = f"/Library/LaunchDaemons/{DAEMON_LABEL}.plist"
++
++# Ultimo macOS ufficiale per modello (tabella v8, indice per hw.model)
++MAX_MACOS_TABLE = {
++    "Macmini3,1": "10.7 Lion",
++    "Macmini4,1": "10.13 High Sierra", "Macmini5,1": "10.13 High Sierra",
++    "Macmini5,2": "10.13 High Sierra", "Macmini5,3": "10.13 High Sierra",
++    "Macmini6,1": "10.15 Catalina", "Macmini6,2": "10.15 Catalina",
++    "Macmini7,1": "12 Monterey",
++    "MacBook4,1": "10.11 El Capitan", "MacBook5,1": "10.11 El Capitan",
++    "MacBook5,2": "10.11 El Capitan", "MacBook6,1": "10.11 El Capitan",
++    "MacBook7,1": "10.11 El Capitan",
++    "MacBook8,1": "11 Big Sur", "MacBook8,2": "11 Big Sur",
++    "MacBookAir2,1": "10.11 El Capitan", "MacBookAir3,1": "10.11 El Capitan",
++    "MacBookAir3,2": "10.11 El Capitan",
++    "MacBookAir4,1": "10.11 El Capitan", "MacBookAir4,2": "10.11 El Capitan",
++    "MacBookAir5,1": "10.15 Catalina", "MacBookAir5,2": "10.15 Catalina",
++    "MacBookAir6,1": "11 Big Sur", "MacBookAir6,2": "11 Big Sur",
++    "MacBookAir7,1": "11 Big Sur", "MacBookAir7,2": "13 Ventura",
++    "MacBookPro4,1": "10.11 El Capitan", "MacBookPro5,1": "10.11 El Capitan",
++    "MacBookPro5,2": "10.11 El Capitan", "MacBookPro5,3": "10.11 El Capitan",
++    "MacBookPro5,4": "10.11 El Capitan", "MacBookPro5,5": "10.11 El Capitan",
++    "MacBookPro6,1": "10.13 High Sierra", "MacBookPro6,2": "10.13 High Sierra",
++    "MacBookPro7,1": "10.13 High Sierra", "MacBookPro8,1": "10.13 High Sierra",
++    "MacBookPro8,2": "10.13 High Sierra", "MacBookPro8,3": "10.13 High Sierra",
++    "MacBookPro9,1": "10.15 Catalina", "MacBookPro9,2": "10.15 Catalina",
++    "MacBookPro10,1": "10.15 Catalina", "MacBookPro10,2": "10.15 Catalina",
++    "MacBookPro11,1": "11 Big Sur", "MacBookPro11,2": "11 Big Sur",
++    "MacBookPro11,3": "11 Big Sur", "MacBookPro11,4": "11 Big Sur",
++    "MacBookPro11,5": "11 Big Sur", "MacBookPro12,1": "11 Big Sur",
++    "MacBookPro13,1": "12 Monterey", "MacBookPro13,2": "12 Monterey",
++    "MacBookPro13,3": "12 Monterey", "MacBookPro14,1": "12 Monterey",
++    "MacBookPro14,2": "12 Monterey", "MacBookPro14,3": "12 Monterey",
++    "iMac9,1": "10.13 High Sierra",
++    "iMac10,1": "10.13 High Sierra", "iMac11,1": "10.13 High Sierra",
++    "iMac11,2": "10.13 High Sierra", "iMac11,3": "10.13 High Sierra",
++    "iMac12,1": "10.13 High Sierra", "iMac12,2": "10.13 High Sierra",
++    "iMac13,1": "10.15 Catalina", "iMac13,2": "10.15 Catalina",
++    "iMac14,1": "11 Big Sur", "iMac14,2": "11 Big Sur", "iMac14,3": "11 Big Sur",
++    "iMac14,4": "11 Big Sur", "iMac15,1": "11 Big Sur",
++    "iMac16,1": "11 Big Sur", "iMac16,2": "11 Big Sur",
++    "iMac17,1": "12 Monterey", "iMac18,1": "12 Monterey",
++    "iMac18,2": "12 Monterey", "iMac18,3": "12 Monterey",
++    "MacPro3,1": "10.11 El Capitan",
++    "MacPro4,1": "10.14 Mojave", "MacPro5,1": "10.14 Mojave",
++    "Xserve3,1": "10.11 El Capitan",
++}
++
++
++def _run(cmd: list) -> tuple:
++    """
++    Esegue un comando e ritorna (successo, output)
++    """
++
++    try:
++        result = subprocess.run(
++            cmd,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            timeout=30
++        )
++        return result.returncode == 0, result.stdout.strip()
++    except Exception:
++        return False, ""
++
++
++def detect_environment() -> dict:
++    """
++    Rileva boot OpenCore (NVRAM), versione OCLP, modello e macOS in uso
++    """
++
++    env = {
++        "oc_boot": False,
++        "oc_version": "",
++        "oclp_version": "",
++        "hw_model": "",
++        "macos": "",
++        "max_official": "",
++    }
++
++    _, oc_version = _run(
++        ["/usr/sbin/nvram", f"{OC_NVRAM_GUID}:opencore-version"]
++    )
++    _, oclp_version = _run(
++        ["/usr/sbin/nvram", f"{OC_NVRAM_GUID}:OCLP-Version"]
++    )
++    _, hw_model = _run(["/usr/sbin/sysctl", "-n", "hw.model"])
++    _, macos = _run(["/usr/bin/sw_vers", "-productVersion"])
++
++    # NVRAM: "GUID:opencore-version\tREL-106-2025-11-03" (+ eventuali %00)
++    if "\t" in oc_version:
++        oc_version = oc_version.split("\t")[-1].replace("%00", "")
++    if "\t" in oclp_version:
++        oclp_version = oclp_version.split("\t")[-1].replace("%00", "")
++
++    env["oc_boot"] = bool(oc_version)
++    env["oc_version"] = oc_version
++    env["oclp_version"] = oclp_version
++    env["hw_model"] = hw_model
++    env["macos"] = macos
++    env["max_official"] = MAX_MACOS_TABLE.get(hw_model, "")
++
++    return env
++
++
++def real_users() -> list:
++    """
++    Utenti reali del Mac (UID >= 500 con home esistente)
++    """
++
++    users = []
++    ok, output = _run(["/usr/bin/dscl", ".", "list", "/Users", "UniqueID"])
++    if not ok:
++        return users
++    for line in output.splitlines():
++        parts = line.split()
++        if len(parts) == 2:
++            name, uid = parts[0], parts[1]
++            try:
++                uid = int(uid)
++            except ValueError:
++                continue
++            if uid >= 500 and Path(f"/Users/{name}").is_dir():
++                users.append(name)
++    return users
++
++
++def badge_flags(home: str) -> Optional[int]:
++    """
++    Flags di SoftwareUpdateNotification da com.apple.ncprefs.plist (o None)
++    """
++
++    plist = Path(home) / "Library/Preferences/com.apple.ncprefs.plist"
++    if not plist.is_file():
++        return None
++    try:
++        with open(plist, "rb") as f:
++            data = plistlib.load(f)
++    except Exception:
++        return None
++    for app in data.get("apps", []):
++        if "SoftwareUpdateNotification" in app.get("bundle-id", ""):
++            return app.get("flags", 0)
++    return None
++
++
++def followup_count(home: str) -> Optional[int]:
++    """
++    Numero di notifiche aggiornamento in coda in CoreFollowUp/items.db
++    """
++
++    db = Path(home) / "Library/CoreFollowUp/items.db"
++    if not db.is_file():
++        return None
++    try:
++        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
++        cur = con.execute(
++            "SELECT COUNT(*) FROM items "
++            "WHERE client_identifier LIKE '%softwareupdate%'"
++        )
++        count = cur.fetchone()[0]
++        con.close()
++        return count
++    except Exception:
++        return None
++
++
++def daemon_installed() -> bool:
++    """
++    Se il LaunchDaemon di pulizia automatica è installato
++    """
++
++    return Path(DAEMON_PLIST).is_file()
++
++
++def build_status_text(env: dict) -> tuple:
++    """
++    Genera (riga_rilevamento, righe_motivo, righe_stato)
++    """
++
++    if env["max_official"]:
++        model_line = f"{env['hw_model']} — ultimo macOS ufficiale: {env['max_official']}"
++    else:
++        model_line = f"{env['hw_model']} — modello non in tabella (presumi limite superato)"
++
++    detection = (
++        f"Boot     : {'OpenCore ' + env['oc_version'] if env['oc_boot'] else 'nativo (nessun OpenCore rilevato)'}\n"
++        f"OCLP     : {env['oclp_version'] or '—'}\n"
++        f"Modello  : {model_line}\n"
++        f"In uso   : macOS {env['macos']}"
++    )
++
++    if env["oc_boot"]:
++        reason = [
++            "⚠ MOTIVO: questo hardware NON supporta ufficialmente questo macOS.",
++            "   Il sistema gira grazie a OpenCore Legacy Patcher. Aggiornamenti",
++            "   MINORI: solo dopo aver aggiornato OCLP, reinstallato OpenCore e,",
++            "   a fine update, i root patch. Upgrade MAJOR: da installer USB",
++            "   (via Impostazioni «non raccomandato», guida ufficiale Dortania).",
++            "   Per questo le notifiche di aggiornamento vengono silenziate.",
++        ]
++    else:
++        reason = [
++            "Mac non-OCLP: il silenziamento è facoltativo (il daemon di pulizia",
++            "automatica, se installato, resta in silenzio su questi Mac).",
++        ]
++
++    state = []
++    if daemon_installed():
++        state.append("Pulizia automatica : ✓ LaunchDaemon installato (ogni 30 min)")
++    else:
++        state.append("Pulizia automatica : · non installata (usa «Silenzia aggiornamenti»)")
++
++    for user in real_users():
++        home = f"/Users/{user}"
++        flags = badge_flags(home)
++        if flags is None:
++            state.append(f"[{user}] badge: ncprefs non leggibile o voce assente")
++        elif flags & 2:
++            state.append(f"[{user}] badge: ⚠ ATTIVO (flags={flags})")
++        else:
++            state.append(f"[{user}] badge: ✓ già silenziato (flags={flags})")
++
++        count = followup_count(home)
++        if count is None:
++            state.append(f"[{user}] CoreFollowUp: non leggibile o inesistente")
++        elif count > 0:
++            state.append(f"[{user}] CoreFollowUp: ⚠ {count} notifiche in coda")
++        else:
++            state.append(f"[{user}] CoreFollowUp: ✓ nessuna notifica in coda")
++
++    return detection, reason, state
++
++
++class SilenceUpdatesFrame(wx.Frame):
++    def __init__(
++        self,
++        parent: wx.Frame,
++        title: str,
++        global_constants: constants.Constants,
++        screen_location: tuple = None
++    ):
++        logging.info("Initializing Silence Updates Frame")
++
++        super(SilenceUpdatesFrame, self).__init__(
++            parent,
++            title=f"Silenzia notifiche aggiornamenti macOS",
++            size=(660, 600),
++            style=wx.DEFAULT_FRAME_STYLE & ~(wx.RESIZE_BORDER | wx.MAXIMIZE_BOX)
++        )
++
++        self.constants: constants.Constants = global_constants
++
++        self._generate_elements()
++
++        self.Centre()
++        self.Show()
++        if screen_location is not None:
++            self.SetPosition(screen_location)
++
++        self._refresh_status()
++
++
++    def _generate_elements(self) -> None:
++        """
++        Genera la finestra:
++          - Rilevamento (boot OpenCore, modello, macOS in uso)
++          - Motivo del silenziamento
++          - Stato (badge, CoreFollowUp, pulizia automatica)
++          - Pulsanti: Aggiorna stato / Silenzia / Ripristina / Chiudi
++        """
++
++        panel = wx.Panel(self)
++        sizer = wx.BoxSizer(wx.VERTICAL)
++        sizer.AddSpacer(10)
++
++        # Titolo
++        title_label = wx.StaticText(panel, label="Silenzia notifiche aggiornamenti macOS (OCLP)")
++        title_label.SetFont(gui_support.font_factory(15, wx.FONTWEIGHT_BOLD))
++        sizer.Add(title_label, 0, wx.ALIGN_CENTRE | wx.BOTTOM, 10)
++
++        # Rilevamento
++        self.detection_text = wx.StaticText(panel, label="…")
++        self.detection_text.SetFont(gui_support.font_factory(12, wx.FONTWEIGHT_NORMAL))
++        sizer.Add(self.detection_text, 0, wx.LEFT | wx.RIGHT, 15)
++
++        # Motivo
++        self.reason_text = wx.StaticText(panel, label="", style=wx.ALIGN_LEFT)
++        self.reason_text.SetFont(gui_support.font_factory(10, wx.FONTWEIGHT_NORMAL))
++        self.reason_text.SetForegroundColour(wx.Colour(140, 60, 0))
++        sizer.Add(self.reason_text, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
++
++        # Stato
++        state_label = wx.StaticText(panel, label="Stato attuale:")
++        state_label.SetFont(gui_support.font_factory(12, wx.FONTWEIGHT_BOLD))
++        sizer.Add(state_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 15)
++
++        self.status_box = wx.TextCtrl(
++            panel,
++            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP,
++            size=(-1, 200)
++        )
++        self.status_box.SetFont(wx.Font(11, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
++        sizer.Add(self.status_box, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 5)
++
++        # Pulsanti
++        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
++
++        refresh_button = wx.Button(panel, label="Aggiorna stato")
++        refresh_button.Bind(wx.EVT_BUTTON, self.on_refresh_status)
++        button_sizer.Add(refresh_button, 0, wx.RIGHT, 5)
++
++        silence_button = wx.Button(panel, label="Silenzia aggiornamenti")
++        silence_button.Bind(wx.EVT_BUTTON, self.on_silence)
++        button_sizer.Add(silence_button, 0, wx.LEFT | wx.RIGHT, 5)
++
++        restore_button = wx.Button(panel, label="Ripristina")
++        restore_button.Bind(wx.EVT_BUTTON, self.on_restore)
++        button_sizer.Add(restore_button, 0, wx.LEFT | wx.RIGHT, 5)
++
++        close_button = wx.Button(panel, label="Chiudi")
++        close_button.Bind(wx.EVT_BUTTON, self.on_close)
++        button_sizer.Add(close_button, 0, wx.LEFT, 5)
++
++        sizer.Add(button_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
++
++        # Nota finale
++        note_label = wx.StaticText(
++            panel,
++            label=(
++                "«Silenzia» installa e avvia il companion con privilegi amministratore "
++                "(via dialogo password di macOS).\n"
++                "Ogni operazione crea un backup con script di ripristino "
++                "in ~/resetta-aggiornamenti-backup/"
++            )
++        )
++        note_label.SetFont(gui_support.font_factory(9, wx.FONTWEIGHT_NORMAL))
++        sizer.Add(note_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
++
++        panel.SetSizer(sizer)
++
++
++    def _refresh_status(self) -> None:
++        """
++        Rilegge l'ambiente e aggiorna i campi
++        """
++
++        env = detect_environment()
++        detection, reason, state = build_status_text(env)
++
++        self.detection_text.SetLabel(detection)
++        self.reason_text.SetLabel("\n".join(reason))
++        self.status_box.SetValue("\n".join(state) + "\n")
++
++
++    def on_refresh_status(self, event: wx.Event = None) -> None:
++        self._refresh_status()
++
++
++    def _elevated(self, shell_cmd: str, prompt: str) -> tuple:
++        """
++        Esegue un comando shell con privilegi amministratore
++        (dialogo password di macOS, come il resto dell'app)
++        """
++
++        escaped = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
++        script = (
++            f'do shell script "{escaped}" '
++            f'with administrator privileges '
++            f'with prompt "{prompt}"'
++        )
++        result = subprocess.run(
++            ["/usr/bin/osascript", "-e", script],
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True
++        )
++        output = result.stdout
++        if result.returncode != 0 and result.stderr:
++            output += "\n" + result.stderr
++        return result.returncode == 0, output
++
++
++    def _companion_bundled_path(self) -> Path:
++        """
++        Percorso del companion dentro l'app (o nel repo, in sviluppo)
++        """
++
++        return self.constants.original_path / "Resetta-Aggiornamenti" / "resetta_aggiornamenti_bash.sh"
++
++
++    def on_silence(self, event: wx.Event = None) -> None:
++        """
++        Silenzia aggiornamenti: installa/aggiorna il companion ed esegue
++        resetta --si (con backup e pulizia automatica LaunchDaemon)
++        """
++
++        bundled = self._companion_bundled_path()
++        if not bundled.is_file():
++            wx.MessageDialog(
++                self,
++                f"Companion non trovato nel bundle:\n{bundled}",
++                "Errore",
++                style=wx.OK | wx.ICON_ERROR
++            ).ShowModal()
++            return
++
++        confirm = wx.MessageDialog(
++            self,
++            (
++                "Confermi il silenziamento delle notifiche di aggiornamento?\n\n"
++                "Verranno disabilitati i demoni di software update, le notifiche\n"
++                "e il badge (con backup e script di ripristino), e verrà installata\n"
++                "la pulizia automatica ogni 30 minuti.\n\n"
++                "Serve la password di amministratore."
++            ),
++            "Silenzia aggiornamenti?",
++            style=wx.YES_NO | wx.YES_DEFAULT | wx.ICON_QUESTION
++        )
++        if confirm.ShowModal() != wx.ID_YES:
++            return
++
++        shell_cmd = (
++            f"mkdir -p '{RESETTA_DIR}' && "
++            f"cp '{bundled}' '{RESETTA_SCRIPT}' && "
++            f"chmod 755 '{RESETTA_SCRIPT}' && "
++            f"bash '{RESETTA_SCRIPT}' resetta --si 2>&1"
++        )
++        ok, output = self._elevated(
++            shell_cmd,
++            "Silenzia notifiche aggiornamenti macOS (OCLP)"
++        )
++
++        self.status_box.SetValue(output + "\n")
++        if ok:
++            wx.MessageDialog(
++                self,
++                "Notifiche di aggiornamento silenziate.\n\nSe il badge ricompare, la pulizia automatica lo rimuove entro 30 minuti.",
++                "Fatto",
++                style=wx.OK | wx.ICON_INFORMATION
++            ).ShowModal()
++        else:
++            wx.MessageDialog(
++                self,
++                f"L'operazione non è riuscita:\n\n{output[-500:]}",
++                "Errore",
++                style=wx.OK | wx.ICON_ERROR
++            ).ShowModal()
++        self._refresh_status()
++
++
++    def on_restore(self, event: wx.Event = None) -> None:
++        """
++        Ripristina l'ultimo backup (da eseguire PRIMA di aggiornare macOS)
++        """
++
++        if not Path(RESETTA_SCRIPT).is_file():
++            wx.MessageDialog(
++                self,
++                "Companion non installato: nulla da ripristinare.\nUsa prima «Silenzia aggiornamenti».",
++                "Ripristina",
++                style=wx.OK | wx.ICON_INFORMATION
++            ).ShowModal()
++            return
++
++        confirm = wx.MessageDialog(
++            self,
++            (
++                "Ripristino l'ultimo backup (riabilita demoni e notifiche)?\n\n"
++                "Usalo PRIMA di aggiornare macOS volutamente, seguendo la guida\n"
++                "ufficiale Dortania. Serve la password di amministratore."
++            ),
++            "Ripristina?",
++            style=wx.YES_NO | wx.ICON_QUESTION
++        )
++        if confirm.ShowModal() != wx.ID_YES:
++            return
++
++        shell_cmd = f"bash '{RESETTA_SCRIPT}' ripristina --si 2>&1"
++        ok, output = self._elevated(shell_cmd, "Ripristina aggiornamenti macOS")
++
++        self.status_box.SetValue(output + "\n")
++        if ok:
++            wx.MessageDialog(
++                self,
++                "Ripristino completato. Riavvia il Mac per sicurezza.\nDopo l'aggiornamento, riesegui «Silenzia aggiornamenti».",
++                "Fatto",
++                style=wx.OK | wx.ICON_INFORMATION
++            ).ShowModal()
++        else:
++            wx.MessageDialog(
++                self,
++                f"Il ripristino non è riuscito:\n\n{output[-500:]}",
++                "Errore",
++                style=wx.OK | wx.ICON_ERROR
++            ).ShowModal()
++        self._refresh_status()
++
++
++    def on_close(self, event: wx.Event = None) -> None:
++        self.Destroy()

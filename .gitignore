@@ -1,0 +1,9 @@
+# build artifacts (never distribute binaries — build your own)
+dist/
+build/
+*.dmg
+*.tar.gz
+*.pkg
+__pycache__/
+*.pyc
+.DS_Store
